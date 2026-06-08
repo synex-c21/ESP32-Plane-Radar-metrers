@@ -13,6 +13,7 @@
 #include "services/radar_location.h"
 #include "ui/radar_range.h"
 #include "ui/radar_theme.h"
+#include "ui/runway_overlay.h"
 
 namespace fonts = lgfx::v1::fonts;
 
@@ -27,6 +28,8 @@ uint16_t kColorAircraft = 0x001F;
 uint16_t kColorTrackVector = 0xFFFF;
 uint16_t kColorTagType = 0x5DFF;
 uint16_t kColorTagAltitude = 0xFFE0;
+uint16_t kColorRunway = 0x4D5F;
+uint16_t kColorRunwayLabel = 0x7DFF;
 
 }  // namespace radar
 
@@ -190,6 +193,10 @@ void initPalette() {
       tft.color565(radar::kTagTypeR, radar::kTagTypeG, radar::kTagTypeB);
   radar::kColorTagAltitude =
       tft.color565(radar::kTagAltR, radar::kTagAltG, radar::kTagAltB);
+  radar::kColorRunway =
+      tft.color565(radar::kRunwayR, radar::kRunwayG, radar::kRunwayB);
+  radar::kColorRunwayLabel = tft.color565(radar::kRunwayLabelR, radar::kRunwayLabelG,
+                                          radar::kRunwayLabelB);
 }
 
 constexpr float kKmPerDeg = 111.0f;
@@ -640,6 +647,8 @@ void drawStaticGrid(Gfx& gfx) {
   gfx.fillScreen(radar::kColorBackground);
   drawRings(cx, cy, grid_r);
   drawCrosshairs(cx, cy, grid_r, radar::kColorGrid);
+  initPalette();
+  runway::drawLargeAirportRunways(gfx);
   drawCenterDot(cx, cy);
   drawCardinalLabels();
   drawScaleLabel(cx, cy, grid_r);
@@ -696,12 +705,6 @@ void radarDisplayRefreshAircraft() {
     return;
   }
 
-  radarDisplayDraw();
-}
-
-void radarDisplayRefreshRange() {
-  initPalette();
-  initLabelMetrics();
   radarDisplayDraw();
 }
 
