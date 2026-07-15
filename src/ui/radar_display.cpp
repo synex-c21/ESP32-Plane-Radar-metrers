@@ -227,10 +227,18 @@ void initPalette() {
 
 constexpr float kKmPerDeg = 111.0f;
 
+/** Equirectangular projection centred on the radar site. One degree of latitude
+ *  is ~111 km anywhere, but one degree of longitude shrinks with cos(lat) — at
+ *  Cluj it is 76 km, not 111. cos() is taken at the centre latitude so the
+ *  projection stays linear. Without it the picture is stretched east-west
+ *  (1.46x at 46.8N, 1.64x at 52N). */
 void offsetKmFromCenter(float lat, float lon, float* dx_km, float* dy_km,
                         float* dist_km) {
-  *dx_km =
-      static_cast<float>(lon - services::location::lon()) * kKmPerDeg;
+  constexpr float kDegToRadLocal = 0.01745329252f;
+  const float coslat =
+      cosf(static_cast<float>(services::location::lat()) * kDegToRadLocal);
+  *dx_km = static_cast<float>(lon - services::location::lon()) * kKmPerDeg *
+           coslat;
   *dy_km =
       static_cast<float>(lat - services::location::lat()) * kKmPerDeg;
   *dist_km = sqrtf((*dx_km) * (*dx_km) + (*dy_km) * (*dy_km));
