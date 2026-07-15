@@ -327,7 +327,7 @@ void fetchRoutes() {
   http.setTimeout(kRequestTimeoutMs);
   http.addHeader("Content-Type", "application/json");
   const int code = http.POST(body);
-  if (code != HTTP_CODE_OK) {
+  if (code < 200 || code >= 300) {  // routeset answers 201, not 200
     Serial.printf("route: HTTP %d\n", code);
     http.end();
     return;
