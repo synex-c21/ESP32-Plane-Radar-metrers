@@ -20,16 +20,16 @@ constexpr float kKmPerNm = 1.852f;
 constexpr int kConnectAttemptMs = 200;
 constexpr unsigned long kRequestTimeoutMs = 10000;
 
-// ---- Route lookup (adsb.lol routeset) ----
-constexpr char kRouteApiUrl[] = "https://api.adsb.lol/api/0/routeset";
+// ---- Route lookup (VRS standing-data static files on GitHub Pages) ----
+// https://vrs-standing-data.adsb.lol/routes/<first 2 of callsign>/<callsign>.json
+// Plain static JSON, refreshed hourly upstream: no POST body, no API quirks.
+constexpr char kRouteBaseUrl[] = "https://vrs-standing-data.adsb.lol/routes/";
 /** Callsign->route cache entries kept across refreshes. */
 constexpr size_t kRouteCacheSize = 32;
-/** Max uncached callsigns asked per refresh; the rest wait for the next one. */
-constexpr size_t kRouteBatchMax = 8;
 /** Skip route lookups entirely when free heap drops below this (bytes). */
 constexpr uint32_t kRouteMinFreeHeap = 60000;
-/** Min gap between route POSTs. Routes are static, so there is no rush, and
- *  adsb.lol is a free service — do not hammer it at the 3 s radar cadence. */
+/** Min gap between route lookups. One callsign per window keeps a single TLS
+ *  session open at a time; routes are static so there is no rush. */
 constexpr unsigned long kRouteFetchIntervalMs = 5000;
 unsigned long s_last_route_fetch_ms = 0;
 
@@ -272,9 +272,10 @@ void buildRouteDisplay(const char* codes, char* out, size_t out_len) {
 }
 
 /** One POST for all uncached callsigns; fills Aircraft::route from cache/API. */
+/** Resolves at most one callsign per window from the static VRS route files. */
 void fetchRoutes() {
-  size_t pending[kRouteBatchMax];
-  size_t m = 0;
+  // Fill everything the cache already knows; note the first unresolved one.
+  int pending = -1;
   for (size_t i = 0; i < s_aircraft_count; ++i) {
     Aircraft& a = s_aircraft[i];
     if (a.callsign[0] == '\0') {
@@ -285,55 +286,47 @@ void fetchRoutes() {
       strlcpy(a.route, cached, sizeof(a.route));
       continue;
     }
-    if (m < kRouteBatchMax) {
-      pending[m++] = i;
+    if (pending < 0 && strnlen(a.callsign, 3) >= 2) {
+      pending = static_cast<int>(i);
     }
   }
-  if (m == 0) {
+  if (pending < 0) {
     return;
   }
   if (s_last_route_fetch_ms != 0 &&
       millis() - s_last_route_fetch_ms < kRouteFetchIntervalMs) {
-    return;  // pending callsigns wait for the next window
+    return;  // the rest resolve over the next windows
   }
   if (ESP.getFreeHeap() < kRouteMinFreeHeap) {
     return;  // radar first; try again when memory allows
   }
   s_last_route_fetch_ms = millis();
 
-  String body = "{\"planes\":[";
-  for (size_t k = 0; k < m; ++k) {
-    const Aircraft& a = s_aircraft[pending[k]];
-    if (k > 0) {
-      body += ',';
-    }
-    body += "{\"callsign\":\"";
-    body += a.callsign;
-    body += "\",\"lat\":";
-    body += String(a.lat, 4);
-    body += ",\"lng\":";
-    body += String(a.lon, 4);
-    body += '}';
-  }
-  body += "]}";
+  char cs[9];
+  strlcpy(cs, s_aircraft[pending].callsign, sizeof(cs));
+
+  char url[96];
+  snprintf(url, sizeof(url), "%s%c%c/%s.json", kRouteBaseUrl, cs[0], cs[1], cs);
 
   WiFiClientSecure client;
   client.setInsecure();
   HTTPClient http;
-  if (!http.begin(client, kRouteApiUrl)) {
+  if (!http.begin(client, url)) {
     return;
   }
   http.setTimeout(kRequestTimeoutMs);
-  http.addHeader("Content-Type", "application/json");
-  const int code = http.POST(body);
-  if (code < 200 || code >= 300) {  // routeset answers 201, not 200
+  const int code = http.GET();
+  if (code == HTTP_CODE_NOT_FOUND) {
+    routeCachePut(cs, "");  // no such route: negative-cache, stop asking
+    http.end();
+    return;
+  }
+  if (code < 200 || code >= 300) {
     Serial.printf("route: HTTP %d\n", code);
     http.end();
     return;
   }
 
-  // getString() waits for the whole body; reading http.getStream() directly
-  // races the network and yields EmptyInput. Body is only a few KB.
   String resp = http.getString();
   http.end();
   if (resp.length() == 0) {
@@ -342,8 +335,7 @@ void fetchRoutes() {
   }
 
   JsonDocument filter;
-  filter[0]["callsign"] = true;
-  filter[0]["_airport_codes_iata"] = true;
+  filter["_airport_codes_iata"] = true;
   JsonDocument doc;
   const DeserializationError err =
       deserializeJson(doc, resp, DeserializationOption::Filter(filter));
@@ -353,21 +345,16 @@ void fetchRoutes() {
     return;
   }
 
-  for (JsonObject r : doc.as<JsonArray>()) {
-    const char* cs = r["callsign"] | "";
-    if (cs[0] == '\0') {
-      continue;
-    }
-    const char* codes = r["_airport_codes_iata"] | "unknown";
-    char route[10];
-    buildRouteDisplay(codes, route, sizeof(route));
-    routeCachePut(cs, route);  // "" is negative-cached: don't re-ask
-    for (size_t i = 0; i < s_aircraft_count; ++i) {
-      if (strcmp(s_aircraft[i].callsign, cs) == 0) {
-        strlcpy(s_aircraft[i].route, route, sizeof(s_aircraft[i].route));
-      }
+  const char* codes = doc["_airport_codes_iata"] | "unknown";
+  char route[10];
+  buildRouteDisplay(codes, route, sizeof(route));
+  routeCachePut(cs, route);
+  for (size_t i = 0; i < s_aircraft_count; ++i) {
+    if (strcmp(s_aircraft[i].callsign, cs) == 0) {
+      strlcpy(s_aircraft[i].route, route, sizeof(s_aircraft[i].route));
     }
   }
+  Serial.printf("route: %s -> %s\n", cs, route[0] != '\0' ? route : "(unknown)");
 }
 
 }  // namespace
