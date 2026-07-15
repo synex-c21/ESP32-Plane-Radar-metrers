@@ -227,13 +227,62 @@ void initPalette() {
 
 constexpr float kKmPerDeg = 111.0f;
 
+/** Equirectangular projection centred on the radar site. One degree of latitude
+ *  is ~111 km anywhere, but one degree of longitude shrinks with cos(lat) — at
+ *  Cluj it is 76 km, not 111. cos() is taken at the centre latitude so the
+ *  projection stays linear. Without it the picture is stretched east-west
+ *  (1.46x at 46.8N, 1.64x at 52N). */
 void offsetKmFromCenter(float lat, float lon, float* dx_km, float* dy_km,
                         float* dist_km) {
-  *dx_km =
-      static_cast<float>(lon - services::location::lon()) * kKmPerDeg;
+  constexpr float kDegToRadLocal = 0.01745329252f;
+  const float coslat =
+      cosf(static_cast<float>(services::location::lat()) * kDegToRadLocal);
+  *dx_km = static_cast<float>(lon - services::location::lon()) * kKmPerDeg *
+           coslat;
   *dy_km =
       static_cast<float>(lat - services::location::lat()) * kKmPerDeg;
   *dist_km = sqrtf((*dx_km) * (*dx_km) + (*dy_km) * (*dy_km));
+}
+
+/** Dead-reckons lat/lon forward by dt_s along the aircraft's ground track.
+ *  Produces TRUE lat/lon (with the cos(lat) longitude correction) so that
+ *  latLonToScreen() distorts it exactly the way it distorts a real fix — the
+ *  predicted dot therefore lands where the next real fix will be drawn. */
+void extrapolatePosition(const services::adsb::Aircraft& plane, float dt_s,
+                         float* out_lat, float* out_lon) {
+  *out_lat = plane.lat;
+  *out_lon = plane.lon;
+
+  if (!config::kAircraftInterpolation) {
+    return;
+  }
+  if (!(dt_s > 0.0f) || dt_s > config::kMaxExtrapolateSeconds) {
+    return;  // no fix yet, or too stale to trust the heading
+  }
+  if (!(plane.gs_knots > 0.0f) || std::isnan(plane.track_deg)) {
+    return;  // no usable velocity: leave it parked
+  }
+
+  constexpr float kDegToRad = 0.01745329252f;
+  const float km = plane.gs_knots * 1.852f * dt_s / 3600.0f;
+  const float track_rad = plane.track_deg * kDegToRad;
+  const float dnorth_km = km * cosf(track_rad);
+  const float deast_km = km * sinf(track_rad);
+
+  *out_lat = plane.lat + dnorth_km / kKmPerDeg;
+  const float coslat = cosf(plane.lat * kDegToRad);
+  if (fabsf(coslat) > 0.01f) {
+    *out_lon = plane.lon + deast_km / (kKmPerDeg * coslat);
+  }
+}
+
+/** Seconds since the positions currently held were fetched. */
+float secondsSinceFix() {
+  const unsigned long fixed_at = services::adsb::lastFetchMs();
+  if (fixed_at == 0) {
+    return 0.0f;
+  }
+  return static_cast<float>(millis() - fixed_at) / 1000.0f;
 }
 
 float innerRingMaxKm() {
@@ -637,16 +686,22 @@ void drawAircraft() {
   size_t draw_count = 0;
   size_t dot_count = 0;
 
+  const float dt_s = secondsSinceFix();
+
   for (size_t i = 0; i < n; ++i) {
+    float lat = 0.0f;
+    float lon = 0.0f;
+    extrapolatePosition(planes[i], dt_s, &lat, &lon);
+
     float dx_km = 0.0f;
     float dy_km = 0.0f;
     float dist_km = 0.0f;
-    offsetKmFromCenter(planes[i].lat, planes[i].lon, &dx_km, &dy_km, &dist_km);
+    offsetKmFromCenter(lat, lon, &dx_km, &dy_km, &dist_km);
 
     if (isInsideOuterRingKm(dist_km)) {
       int x = 0;
       int y = 0;
-      latLonToScreen(planes[i].lat, planes[i].lon, &x, &y);
+      latLonToScreen(lat, lon, &x, &y);
       items[draw_count].index = i;
       items[draw_count].x = x;
       items[draw_count].y = y;
@@ -657,8 +712,7 @@ void drawAircraft() {
 
     int dot_x = 0;
     int dot_y = 0;
-    if (!beyondRingEdgeDotFromLatLon(planes[i].lat, planes[i].lon, &dot_x,
-                                     &dot_y)) {
+    if (!beyondRingEdgeDotFromLatLon(lat, lon, &dot_x, &dot_y)) {
       continue;
     }
     dots[dot_count].x = dot_x;
