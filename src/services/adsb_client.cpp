@@ -323,7 +323,6 @@ void fetchRoutes() {
   if (!http.begin(client, kRouteApiUrl)) {
     return;
   }
-  http.useHTTP10(true);  // no chunked encoding -> stream-parse safe
   http.setTimeout(kRequestTimeoutMs);
   http.addHeader("Content-Type", "application/json");
   const int code = http.POST(body);
@@ -333,15 +332,24 @@ void fetchRoutes() {
     return;
   }
 
+  // getString() waits for the whole body; reading http.getStream() directly
+  // races the network and yields EmptyInput. Body is only a few KB.
+  String resp = http.getString();
+  http.end();
+  if (resp.length() == 0) {
+    Serial.println("route: empty body");
+    return;
+  }
+
   JsonDocument filter;
   filter[0]["callsign"] = true;
   filter[0]["_airport_codes_iata"] = true;
   JsonDocument doc;
-  const DeserializationError err = deserializeJson(
-      doc, http.getStream(), DeserializationOption::Filter(filter));
-  http.end();
+  const DeserializationError err =
+      deserializeJson(doc, resp, DeserializationOption::Filter(filter));
   if (err) {
-    Serial.printf("route: JSON %s\n", err.c_str());
+    Serial.printf("route: JSON %s len=%u head=%.60s\n", err.c_str(),
+                  static_cast<unsigned>(resp.length()), resp.c_str());
     return;
   }
 
