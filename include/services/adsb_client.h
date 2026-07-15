@@ -10,6 +10,8 @@ struct Aircraft {
   float nose_deg;
   float track_deg;
   float gs_knots;
+  /** Vertical rate in ft/min from baro_rate/geom_rate; NAN when unknown. */
+  float vrate_fpm;
   char callsign[9];
   char type[5];
   char alt[12];
