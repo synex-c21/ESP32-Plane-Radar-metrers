@@ -404,6 +404,14 @@ void applyTagStyle() {
   }
 }
 
+/** Tag line 1: route when known ("CLJ>LTN"), else the callsign. */
+const char* tagTopLine(const services::adsb::Aircraft& plane) {
+  if (plane.route[0] != '\0') {
+    return plane.route;
+  }
+  return plane.callsign;
+}
+
 /** Tag line 2, left part: "B744," when speed follows, else "B744". */
 void formatTypePart(const services::adsb::Aircraft& plane, char* out,
                     size_t out_len) {
@@ -457,10 +465,13 @@ void drawVRateArrow(int x, int ly, int line_h, int dir) {
 int measureTagBlockWidth(const services::adsb::Aircraft& plane) {
   applyTagStyle();
   int max_w = 0;
-  if (plane.callsign[0] != '\0') {
-    const int w = s_draw->textWidth(plane.callsign);
-    if (w > max_w) {
-      max_w = w;
+  {
+    const char* top = tagTopLine(plane);
+    if (top[0] != '\0') {
+      const int w = s_draw->textWidth(top);
+      if (w > max_w) {
+        max_w = w;
+      }
     }
   }
   {
@@ -519,9 +530,12 @@ void drawAircraftTag(int x, int y, const services::adsb::Aircraft& plane) {
   }
   ly = std::max(1, std::min(ly, radar::kSize - block_h - 1));
 
-  if (plane.callsign[0] != '\0') {
-    s_draw->setTextColor(radar::kColorLabel, radar::kColorBackground);
-    s_draw->drawString(plane.callsign, anchor_x, ly);
+  {
+    const char* top = tagTopLine(plane);
+    if (top[0] != '\0') {
+      s_draw->setTextColor(radar::kColorLabel, radar::kColorBackground);
+      s_draw->drawString(top, anchor_x, ly);
+    }
   }
   ly += line_h;
 
