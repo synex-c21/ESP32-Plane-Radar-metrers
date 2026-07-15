@@ -5,6 +5,7 @@
 
 #include <ArduinoJson.h>
 
+#include <cmath>
 #include <cstring>
 
 #include "config.h"
@@ -195,6 +196,14 @@ void fillTagFields(Aircraft* ac, const JsonObject& plane) {
 
   copyJsonStringTrimmed(plane, "t", ac->type, sizeof(ac->type));
   formatAltitudeTag(plane, ac->alt, sizeof(ac->alt));
+
+  float rate = 0.0f;
+  if (readJsonFloat(plane, "baro_rate", &rate) ||
+      readJsonFloat(plane, "geom_rate", &rate)) {
+    ac->vrate_fpm = rate;
+  } else {
+    ac->vrate_fpm = NAN;
+  }
 }
 
 }  // namespace
