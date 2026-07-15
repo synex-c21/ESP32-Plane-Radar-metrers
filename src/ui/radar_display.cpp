@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 
 #include "config.h"
@@ -378,6 +379,81 @@ void applyTagStyle() {
   }
 }
 
+/** Numeric altitude (m) from the formatted tag: "10973 m" -> 10973, "GND" -> 0. */
+float altitudeMetersFromTag(const char* alt) {
+  if (alt == nullptr || alt[0] == '\0') {
+    return -1.0f;  // unknown
+  }
+  if (alt[0] == 'G') {  // "GND"
+    return 0.0f;
+  }
+  return static_cast<float>(atof(alt));
+}
+
+/** FR24-style altitude ramp: ground = red, cruise = violet. */
+uint16_t aircraftColorForAltitude(float alt_m) {
+  struct Stop {
+    float m;
+    uint8_t r;
+    uint8_t g;
+    uint8_t b;
+  };
+  static constexpr Stop kStops[] = {
+      {0.0f, 255, 40, 40},    {1500.0f, 255, 140, 0},
+      {3000.0f, 255, 230, 0}, {6000.0f, 60, 240, 60},
+      {9000.0f, 0, 200, 255}, {12000.0f, 150, 110, 255},
+  };
+  constexpr int kN = static_cast<int>(sizeof(kStops) / sizeof(kStops[0]));
+
+  if (alt_m < 0.0f) {
+    return radar::kColorAircraft;  // no altitude data: keep the default symbol
+  }
+
+  uint8_t r = kStops[kN - 1].r;
+  uint8_t g = kStops[kN - 1].g;
+  uint8_t b = kStops[kN - 1].b;
+
+  if (alt_m <= kStops[0].m) {
+    r = kStops[0].r;
+    g = kStops[0].g;
+    b = kStops[0].b;
+  } else if (alt_m < kStops[kN - 1].m) {
+    for (int i = 0; i + 1 < kN; ++i) {
+      if (alt_m >= kStops[i].m && alt_m < kStops[i + 1].m) {
+        const float t = (alt_m - kStops[i].m) / (kStops[i + 1].m - kStops[i].m);
+        r = static_cast<uint8_t>(
+            lroundf(kStops[i].r + t * (kStops[i + 1].r - kStops[i].r)));
+        g = static_cast<uint8_t>(
+            lroundf(kStops[i].g + t * (kStops[i + 1].g - kStops[i].g)));
+        b = static_cast<uint8_t>(
+            lroundf(kStops[i].b + t * (kStops[i + 1].b - kStops[i].b)));
+        break;
+      }
+    }
+  }
+
+  // GC9A01 BGR panel: same R/B swap initPalette() applies to kColorAircraft.
+  if (config::kDisplayRgbOrder) {
+    return tft.color565(b, g, r);
+  }
+  return tft.color565(r, g, b);
+}
+
+/** Tag line 2: type + ground speed in km/h, e.g. "A21N 874". */
+void formatTypeSpeedLine(const services::adsb::Aircraft& plane, char* out,
+                         size_t out_len) {
+  const int kmh = static_cast<int>(lroundf(plane.gs_knots * 1.852f));
+  if (plane.type[0] != '\0' && kmh > 0) {
+    snprintf(out, out_len, "%s %d", plane.type, kmh);
+  } else if (plane.type[0] != '\0') {
+    snprintf(out, out_len, "%s", plane.type);
+  } else if (kmh > 0) {
+    snprintf(out, out_len, "%d", kmh);
+  } else {
+    out[0] = '\0';
+  }
+}
+
 int measureTagBlockWidth(const services::adsb::Aircraft& plane) {
   applyTagStyle();
   int max_w = 0;
@@ -387,8 +463,10 @@ int measureTagBlockWidth(const services::adsb::Aircraft& plane) {
       max_w = w;
     }
   }
-  if (plane.type[0] != '\0') {
-    const int w = s_draw->textWidth(plane.type);
+  char type_line[16];
+  formatTypeSpeedLine(plane, type_line, sizeof(type_line));
+  if (type_line[0] != '\0') {
+    const int w = s_draw->textWidth(type_line);
     if (w > max_w) {
       max_w = w;
     }
@@ -433,9 +511,11 @@ void drawAircraftTag(int x, int y, const services::adsb::Aircraft& plane) {
   }
   ly += line_h;
 
-  if (plane.type[0] != '\0') {
+  char type_line[16];
+  formatTypeSpeedLine(plane, type_line, sizeof(type_line));
+  if (type_line[0] != '\0') {
     s_draw->setTextColor(radar::kColorTagType, radar::kColorBackground);
-    s_draw->drawString(plane.type, anchor_x, ly);
+    s_draw->drawString(type_line, anchor_x, ly);
   }
   ly += line_h;
 
@@ -535,7 +615,9 @@ void drawAircraft() {
     const int y = items[d].y;
     drawSpeedVector(x, y, planes[i].nose_deg, planes[i].track_deg,
                     planes[i].gs_knots, radar::kColorTrackVector);
-    drawHeadingTriangle(x, y, planes[i].nose_deg, radar::kColorAircraft);
+    drawHeadingTriangle(
+        x, y, planes[i].nose_deg,
+        aircraftColorForAltitude(altitudeMetersFromTag(planes[i].alt)));
   }
   for (size_t d = 0; d < draw_count; ++d) {
     const size_t i = items[d].index;
