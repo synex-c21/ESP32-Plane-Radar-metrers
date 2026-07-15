@@ -1,5 +1,6 @@
 #include "services/adsb_client.h"
 
+#include <Arduino.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 
@@ -18,6 +19,27 @@ constexpr char kApiBase[] = "https://opendata.adsb.fi/api/v3/lat/";
 constexpr float kKmPerNm = 1.852f;
 constexpr int kConnectAttemptMs = 200;
 constexpr unsigned long kRequestTimeoutMs = 10000;
+
+// ---- Route lookup (adsb.lol routeset) ----
+constexpr char kRouteApiUrl[] = "https://api.adsb.lol/api/0/routeset";
+/** Callsign->route cache entries kept across refreshes. */
+constexpr size_t kRouteCacheSize = 32;
+/** Max uncached callsigns asked per refresh; the rest wait for the next one. */
+constexpr size_t kRouteBatchMax = 8;
+/** Skip route lookups entirely when free heap drops below this (bytes). */
+constexpr uint32_t kRouteMinFreeHeap = 60000;
+/** Min gap between route POSTs. Routes are static, so there is no rush, and
+ *  adsb.lol is a free service — do not hammer it at the 3 s radar cadence. */
+constexpr unsigned long kRouteFetchIntervalMs = 15000;
+unsigned long s_last_route_fetch_ms = 0;
+
+struct RouteCacheEntry {
+  char callsign[9];
+  char route[10];
+  bool used;
+};
+RouteCacheEntry s_route_cache[kRouteCacheSize] = {};
+size_t s_route_cache_next = 0;
 
 Aircraft s_aircraft[kMaxAircraft];
 size_t s_aircraft_count = 0;
@@ -196,6 +218,7 @@ void fillTagFields(Aircraft* ac, const JsonObject& plane) {
 
   copyJsonStringTrimmed(plane, "t", ac->type, sizeof(ac->type));
   formatAltitudeTag(plane, ac->alt, sizeof(ac->alt));
+  ac->route[0] = '\0';  // filled later by fetchRoutes()
 
   float rate = 0.0f;
   if (readJsonFloat(plane, "baro_rate", &rate) ||
@@ -203,6 +226,139 @@ void fillTagFields(Aircraft* ac, const JsonObject& plane) {
     ac->vrate_fpm = rate;
   } else {
     ac->vrate_fpm = NAN;
+  }
+}
+
+const char* routeCacheFind(const char* callsign) {
+  for (const RouteCacheEntry& e : s_route_cache) {
+    if (e.used && strcmp(e.callsign, callsign) == 0) {
+      return e.route;
+    }
+  }
+  return nullptr;
+}
+
+void routeCachePut(const char* callsign, const char* route) {
+  RouteCacheEntry& e = s_route_cache[s_route_cache_next];
+  s_route_cache_next = (s_route_cache_next + 1) % kRouteCacheSize;
+  e.used = true;
+  strlcpy(e.callsign, callsign, sizeof(e.callsign));
+  strlcpy(e.route, route, sizeof(e.route));
+}
+
+/** "CLJ-LTN" / "EGKK-LROP-OMDB" -> "CLJ>LTN" (first>last); "unknown" -> "". */
+void buildRouteDisplay(const char* codes, char* out, size_t out_len) {
+  out[0] = '\0';
+  if (codes == nullptr || strcmp(codes, "unknown") == 0) {
+    return;
+  }
+  const char* dash = strchr(codes, '-');
+  if (dash == nullptr) {
+    return;
+  }
+  const char* last = strrchr(codes, '-') + 1;
+  size_t first_len = static_cast<size_t>(dash - codes);
+  if (first_len > 4) {
+    first_len = 4;
+  }
+  const size_t last_len = strnlen(last, 4);
+  if (first_len + 1 + last_len + 1 > out_len) {
+    return;
+  }
+  memcpy(out, codes, first_len);
+  out[first_len] = '>';
+  memcpy(out + first_len + 1, last, last_len);
+  out[first_len + 1 + last_len] = '\0';
+}
+
+/** One POST for all uncached callsigns; fills Aircraft::route from cache/API. */
+void fetchRoutes() {
+  size_t pending[kRouteBatchMax];
+  size_t m = 0;
+  for (size_t i = 0; i < s_aircraft_count; ++i) {
+    Aircraft& a = s_aircraft[i];
+    if (a.callsign[0] == '\0') {
+      continue;
+    }
+    const char* cached = routeCacheFind(a.callsign);
+    if (cached != nullptr) {
+      strlcpy(a.route, cached, sizeof(a.route));
+      continue;
+    }
+    if (m < kRouteBatchMax) {
+      pending[m++] = i;
+    }
+  }
+  if (m == 0) {
+    return;
+  }
+  if (s_last_route_fetch_ms != 0 &&
+      millis() - s_last_route_fetch_ms < kRouteFetchIntervalMs) {
+    return;  // pending callsigns wait for the next window
+  }
+  if (ESP.getFreeHeap() < kRouteMinFreeHeap) {
+    return;  // radar first; try again when memory allows
+  }
+  s_last_route_fetch_ms = millis();
+
+  String body = "{\"planes\":[";
+  for (size_t k = 0; k < m; ++k) {
+    const Aircraft& a = s_aircraft[pending[k]];
+    if (k > 0) {
+      body += ',';
+    }
+    body += "{\"callsign\":\"";
+    body += a.callsign;
+    body += "\",\"lat\":";
+    body += String(a.lat, 4);
+    body += ",\"lng\":";
+    body += String(a.lon, 4);
+    body += '}';
+  }
+  body += "]}";
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  if (!http.begin(client, kRouteApiUrl)) {
+    return;
+  }
+  http.useHTTP10(true);  // no chunked encoding -> stream-parse safe
+  http.setTimeout(kRequestTimeoutMs);
+  http.addHeader("Content-Type", "application/json");
+  const int code = http.POST(body);
+  if (code != HTTP_CODE_OK) {
+    Serial.printf("route: HTTP %d\n", code);
+    http.end();
+    return;
+  }
+
+  JsonDocument filter;
+  filter[0]["callsign"] = true;
+  filter[0]["_airport_codes_iata"] = true;
+  JsonDocument doc;
+  const DeserializationError err = deserializeJson(
+      doc, http.getStream(), DeserializationOption::Filter(filter));
+  http.end();
+  if (err) {
+    Serial.printf("route: JSON %s\n", err.c_str());
+    return;
+  }
+
+  for (JsonObject r : doc.as<JsonArray>()) {
+    const char* cs = r["callsign"] | "";
+    if (cs[0] == '\0') {
+      continue;
+    }
+    const char* codes = r["_airport_codes_iata"] | "unknown";
+    char route[10];
+    buildRouteDisplay(codes, route, sizeof(route));
+    routeCachePut(cs, route);  // "" is negative-cached: don't re-ask
+    for (size_t i = 0; i < s_aircraft_count; ++i) {
+      if (strcmp(s_aircraft[i].callsign, cs) == 0) {
+        strlcpy(s_aircraft[i].route, route, sizeof(s_aircraft[i].route));
+      }
+    }
   }
 }
 
@@ -214,7 +370,10 @@ size_t aircraftCount() { return s_aircraft_count; }
 
 const Aircraft* aircraftList() { return s_aircraft; }
 
-bool fetchUpdate(double center_lat, double center_lon, float fetch_radius_km) {
+/** Fetches + parses the aircraft list. Keeps payload/doc scoped to this call so
+ *  they are freed before any further TLS session is opened. */
+bool fetchAircraftList(double center_lat, double center_lon,
+                       float fetch_radius_km) {
   const float dist_nm = kmToNauticalMiles(fetch_radius_km);
 
   String url = kApiBase;
@@ -285,6 +444,16 @@ bool fetchUpdate(double center_lat, double center_lon, float fetch_radius_km) {
 
   s_aircraft_count = n;
   Serial.printf("adsb: %u aircraft\n", static_cast<unsigned>(n));
+  return true;
+}
+
+bool fetchUpdate(double center_lat, double center_lon, float fetch_radius_km) {
+  // Aircraft first: its payload/doc/TLS are all released when this returns.
+  if (!fetchAircraftList(center_lat, center_lon, fetch_radius_km)) {
+    return false;
+  }
+  // Only now, on a clean heap, look up routes.
+  fetchRoutes();
   return true;
 }
 
