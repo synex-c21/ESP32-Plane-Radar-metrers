@@ -55,6 +55,16 @@ constexpr float kAdsbFetchRadiusScale = 1.0f;
 /** false = hide aircraft with alt_baro "ground"; true = show them too. */
 constexpr bool kAdsbShowGroundAircraft = false;
 
+/** Dead-reckon aircraft between fetches from track + ground speed, redrawing at
+ *  kRadarDrawIntervalMs. Set to false for the original draw-on-fetch behaviour;
+ *  nothing else needs changing. */
+constexpr bool kAircraftInterpolation = true;
+/** Redraw cadence while interpolating. Ignored when interpolation is off. */
+constexpr unsigned long kRadarDrawIntervalMs = 100;
+/** Give up extrapolating if the last fix is older than this (s) — a stalled
+ *  fetch must not fling aircraft across the screen on a stale heading. */
+constexpr float kMaxExtrapolateSeconds = 10.0f;
+
 // --- UI colors (RGB565) — status screens ---
 constexpr uint16_t kColorBlack = 0x0000;
 constexpr uint16_t kColorYellow = 0xFFE0;
