@@ -36,6 +36,20 @@ uint16_t kColorRunwayLabel = 0x7DFF;
 
 namespace {
 
+/** Tag speed (km/h) color; set in initPalette. R==B so BGR panels render it the same. */
+uint16_t s_color_tag_speed = 0xFFFF;
+/** Climb / descend arrow colors; set in initPalette. */
+uint16_t s_color_climb = 0x07E0;
+uint16_t s_color_descend = 0xF800;
+/** |vertical rate| must exceed this (ft/min) to show a climb/descend arrow. */
+constexpr float kVrateThresholdFpm = 128.0f;
+/** Climb/descend arrow geometry (px). */
+constexpr int kVrateArrowW = 7;
+constexpr int kVrateArrowH = 7;
+constexpr int kVrateArrowGapPx = 3;
+/** Gap between the type and speed parts on tag line 2 (px). */
+constexpr int kTypeSpeedGapPx = 4;
+
 bool s_label_metrics_ready = false;
 bool s_cardinal_use_vlw = false;
 bool s_scale_use_vlw = false;
@@ -198,6 +212,17 @@ void initPalette() {
       tft.color565(radar::kRunwayR, radar::kRunwayG, radar::kRunwayB);
   radar::kColorRunwayLabel = tft.color565(radar::kRunwayLabelR, radar::kRunwayLabelG,
                                           radar::kRunwayLabelB);
+
+  // Speed text: pale green; R == B so the BGR swap has no visual effect.
+  s_color_tag_speed = tft.color565(150, 235, 150);
+  // Climb arrow: green (R == B, swap-proof).
+  s_color_climb = tft.color565(30, 220, 30);
+  // Descend arrow: red; needs the same R/B swap as kColorAircraft on BGR panels.
+  if (config::kDisplayRgbOrder) {
+    s_color_descend = tft.color565(40, 40, 235);
+  } else {
+    s_color_descend = tft.color565(235, 40, 40);
+  }
 }
 
 constexpr float kKmPerDeg = 111.0f;
@@ -379,78 +404,53 @@ void applyTagStyle() {
   }
 }
 
-/** Numeric altitude (m) from the formatted tag: "10973 m" -> 10973, "GND" -> 0. */
-float altitudeMetersFromTag(const char* alt) {
-  if (alt == nullptr || alt[0] == '\0') {
-    return -1.0f;  // unknown
-  }
-  if (alt[0] == 'G') {  // "GND"
-    return 0.0f;
-  }
-  return static_cast<float>(atof(alt));
-}
-
-/** FR24-style altitude ramp: ground = red, cruise = violet. */
-uint16_t aircraftColorForAltitude(float alt_m) {
-  struct Stop {
-    float m;
-    uint8_t r;
-    uint8_t g;
-    uint8_t b;
-  };
-  static constexpr Stop kStops[] = {
-      {0.0f, 255, 40, 40},    {1500.0f, 255, 140, 0},
-      {3000.0f, 255, 230, 0}, {6000.0f, 60, 240, 60},
-      {9000.0f, 0, 200, 255}, {12000.0f, 150, 110, 255},
-  };
-  constexpr int kN = static_cast<int>(sizeof(kStops) / sizeof(kStops[0]));
-
-  if (alt_m < 0.0f) {
-    return radar::kColorAircraft;  // no altitude data: keep the default symbol
-  }
-
-  uint8_t r = kStops[kN - 1].r;
-  uint8_t g = kStops[kN - 1].g;
-  uint8_t b = kStops[kN - 1].b;
-
-  if (alt_m <= kStops[0].m) {
-    r = kStops[0].r;
-    g = kStops[0].g;
-    b = kStops[0].b;
-  } else if (alt_m < kStops[kN - 1].m) {
-    for (int i = 0; i + 1 < kN; ++i) {
-      if (alt_m >= kStops[i].m && alt_m < kStops[i + 1].m) {
-        const float t = (alt_m - kStops[i].m) / (kStops[i + 1].m - kStops[i].m);
-        r = static_cast<uint8_t>(
-            lroundf(kStops[i].r + t * (kStops[i + 1].r - kStops[i].r)));
-        g = static_cast<uint8_t>(
-            lroundf(kStops[i].g + t * (kStops[i + 1].g - kStops[i].g)));
-        b = static_cast<uint8_t>(
-            lroundf(kStops[i].b + t * (kStops[i + 1].b - kStops[i].b)));
-        break;
-      }
-    }
-  }
-
-  // GC9A01 BGR panel: same R/B swap initPalette() applies to kColorAircraft.
-  if (config::kDisplayRgbOrder) {
-    return tft.color565(b, g, r);
-  }
-  return tft.color565(r, g, b);
-}
-
-/** Tag line 2: type + ground speed in km/h, e.g. "A21N 874". */
-void formatTypeSpeedLine(const services::adsb::Aircraft& plane, char* out,
-                         size_t out_len) {
+/** Tag line 2, left part: "B744," when speed follows, else "B744". */
+void formatTypePart(const services::adsb::Aircraft& plane, char* out,
+                    size_t out_len) {
   const int kmh = static_cast<int>(lroundf(plane.gs_knots * 1.852f));
   if (plane.type[0] != '\0' && kmh > 0) {
-    snprintf(out, out_len, "%s %d", plane.type, kmh);
+    snprintf(out, out_len, "%s,", plane.type);
   } else if (plane.type[0] != '\0') {
     snprintf(out, out_len, "%s", plane.type);
-  } else if (kmh > 0) {
+  } else {
+    out[0] = '\0';
+  }
+}
+
+/** Tag line 2, right part: ground speed in km/h, e.g. "961". */
+void formatSpeedPart(const services::adsb::Aircraft& plane, char* out,
+                     size_t out_len) {
+  const int kmh = static_cast<int>(lroundf(plane.gs_knots * 1.852f));
+  if (kmh > 0) {
     snprintf(out, out_len, "%d", kmh);
   } else {
     out[0] = '\0';
+  }
+}
+
+/** -1 descend, +1 climb, 0 level/unknown. */
+int vrateDirection(const services::adsb::Aircraft& plane) {
+  if (std::isnan(plane.vrate_fpm)) {
+    return 0;
+  }
+  if (plane.vrate_fpm >= kVrateThresholdFpm) {
+    return 1;
+  }
+  if (plane.vrate_fpm <= -kVrateThresholdFpm) {
+    return -1;
+  }
+  return 0;
+}
+
+/** Small solid arrow at (x, line top ly): up = climbing, down = descending. */
+void drawVRateArrow(int x, int ly, int line_h, int dir) {
+  const int ty = ly + (line_h - kVrateArrowH) / 2;
+  if (dir > 0) {
+    s_draw->fillTriangle(x + kVrateArrowW / 2, ty, x, ty + kVrateArrowH,
+                         x + kVrateArrowW, ty + kVrateArrowH, s_color_climb);
+  } else if (dir < 0) {
+    s_draw->fillTriangle(x + kVrateArrowW / 2, ty + kVrateArrowH, x, ty,
+                         x + kVrateArrowW, ty, s_color_descend);
   }
 }
 
@@ -463,16 +463,30 @@ int measureTagBlockWidth(const services::adsb::Aircraft& plane) {
       max_w = w;
     }
   }
-  char type_line[16];
-  formatTypeSpeedLine(plane, type_line, sizeof(type_line));
-  if (type_line[0] != '\0') {
-    const int w = s_draw->textWidth(type_line);
+  {
+    char type_part[10];
+    char speed_part[8];
+    formatTypePart(plane, type_part, sizeof(type_part));
+    formatSpeedPart(plane, speed_part, sizeof(speed_part));
+    int w = 0;
+    if (type_part[0] != '\0') {
+      w += s_draw->textWidth(type_part);
+    }
+    if (speed_part[0] != '\0') {
+      w += s_draw->textWidth(speed_part);
+    }
+    if (type_part[0] != '\0' && speed_part[0] != '\0') {
+      w += kTypeSpeedGapPx;
+    }
     if (w > max_w) {
       max_w = w;
     }
   }
   if (plane.alt[0] != '\0') {
-    const int w = s_draw->textWidth(plane.alt);
+    int w = s_draw->textWidth(plane.alt);
+    if (vrateDirection(plane) != 0) {
+      w += kVrateArrowGapPx + kVrateArrowW;
+    }
     if (w > max_w) {
       max_w = w;
     }
@@ -511,17 +525,53 @@ void drawAircraftTag(int x, int y, const services::adsb::Aircraft& plane) {
   }
   ly += line_h;
 
-  char type_line[16];
-  formatTypeSpeedLine(plane, type_line, sizeof(type_line));
-  if (type_line[0] != '\0') {
-    s_draw->setTextColor(radar::kColorTagType, radar::kColorBackground);
-    s_draw->drawString(type_line, anchor_x, ly);
+  {
+    char type_part[10];
+    char speed_part[8];
+    formatTypePart(plane, type_part, sizeof(type_part));
+    formatSpeedPart(plane, speed_part, sizeof(speed_part));
+    const int w_type =
+        (type_part[0] != '\0') ? s_draw->textWidth(type_part) : 0;
+    const int w_speed =
+        (speed_part[0] != '\0') ? s_draw->textWidth(speed_part) : 0;
+    if (tag_on_right) {
+      // top_left datum: type at anchor, speed right after it.
+      if (type_part[0] != '\0') {
+        s_draw->setTextColor(radar::kColorTagType, radar::kColorBackground);
+        s_draw->drawString(type_part, anchor_x, ly);
+      }
+      if (speed_part[0] != '\0') {
+        s_draw->setTextColor(s_color_tag_speed, radar::kColorBackground);
+        s_draw->drawString(speed_part, anchor_x + w_type + kTypeSpeedGapPx, ly);
+      }
+    } else {
+      // top_right datum: speed ends at anchor, type ends where speed starts.
+      if (speed_part[0] != '\0') {
+        s_draw->setTextColor(s_color_tag_speed, radar::kColorBackground);
+        s_draw->drawString(speed_part, anchor_x, ly);
+      }
+      if (type_part[0] != '\0') {
+        s_draw->setTextColor(radar::kColorTagType, radar::kColorBackground);
+        s_draw->drawString(type_part, anchor_x - w_speed - kTypeSpeedGapPx, ly);
+      }
+    }
   }
   ly += line_h;
 
   if (plane.alt[0] != '\0') {
     s_draw->setTextColor(radar::kColorTagAltitude, radar::kColorBackground);
     s_draw->drawString(plane.alt, anchor_x, ly);
+    const int dir = vrateDirection(plane);
+    if (dir != 0) {
+      const int w_alt = s_draw->textWidth(plane.alt);
+      int ax = 0;
+      if (tag_on_right) {
+        ax = anchor_x + w_alt + kVrateArrowGapPx;
+      } else {
+        ax = anchor_x - w_alt - kVrateArrowGapPx - kVrateArrowW;
+      }
+      drawVRateArrow(ax, ly, line_h, dir);
+    }
   }
 }
 
@@ -615,9 +665,7 @@ void drawAircraft() {
     const int y = items[d].y;
     drawSpeedVector(x, y, planes[i].nose_deg, planes[i].track_deg,
                     planes[i].gs_knots, radar::kColorTrackVector);
-    drawHeadingTriangle(
-        x, y, planes[i].nose_deg,
-        aircraftColorForAltitude(altitudeMetersFromTag(planes[i].alt)));
+    drawHeadingTriangle(x, y, planes[i].nose_deg, radar::kColorAircraft);
   }
   for (size_t d = 0; d < draw_count; ++d) {
     const size_t i = items[d].index;
