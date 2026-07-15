@@ -30,7 +30,7 @@ constexpr size_t kRouteBatchMax = 8;
 constexpr uint32_t kRouteMinFreeHeap = 60000;
 /** Min gap between route POSTs. Routes are static, so there is no rush, and
  *  adsb.lol is a free service — do not hammer it at the 3 s radar cadence. */
-constexpr unsigned long kRouteFetchIntervalMs = 15000;
+constexpr unsigned long kRouteFetchIntervalMs = 5000;
 unsigned long s_last_route_fetch_ms = 0;
 
 struct RouteCacheEntry {
