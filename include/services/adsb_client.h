@@ -31,4 +31,8 @@ void setPollFn(PollFn fn);
 /** Fetch aircraft within fetch_radius_km of center_lat/lon from adsb.fi. */
 bool fetchUpdate(double center_lat, double center_lon, float fetch_radius_km);
 
+/** millis() when the current positions were fetched; 0 before the first fix.
+ *  Used to dead-reckon aircraft forward between fetches. */
+unsigned long lastFetchMs();
+
 }  // namespace services::adsb
