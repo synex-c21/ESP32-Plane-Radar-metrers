@@ -27,7 +27,7 @@ constexpr char kRouteBaseUrl[] = "https://vrs-standing-data.adsb.lol/routes/";
 /** Callsign->route cache entries kept across refreshes. */
 constexpr size_t kRouteCacheSize = 32;
 /** Skip route lookups entirely when free heap drops below this (bytes). */
-constexpr uint32_t kRouteMinFreeHeap = 60000;
+constexpr uint32_t kRouteMinFreeHeap = 45000;
 /** Min gap between route lookups. One callsign per window keeps a single TLS
  *  session open at a time; routes are static so there is no rush. */
 constexpr unsigned long kRouteFetchIntervalMs = 5000;
@@ -43,6 +43,7 @@ size_t s_route_cache_next = 0;
 
 Aircraft s_aircraft[kMaxAircraft];
 size_t s_aircraft_count = 0;
+unsigned long s_last_fetch_ms = 0;
 PollFn s_poll_fn = nullptr;
 
 void pollNetwork() {
@@ -297,7 +298,11 @@ void fetchRoutes() {
       millis() - s_last_route_fetch_ms < kRouteFetchIntervalMs) {
     return;  // the rest resolve over the next windows
   }
-  if (ESP.getFreeHeap() < kRouteMinFreeHeap) {
+  const uint32_t heap = ESP.getFreeHeap();
+  if (heap < kRouteMinFreeHeap) {
+    Serial.printf("route: skip, heap %u < %u\n", static_cast<unsigned>(heap),
+                  static_cast<unsigned>(kRouteMinFreeHeap));
+    s_last_route_fetch_ms = millis();  // don't spam this check every 3 s
     return;  // radar first; try again when memory allows
   }
   s_last_route_fetch_ms = millis();
@@ -312,9 +317,11 @@ void fetchRoutes() {
   client.setInsecure();
   HTTPClient http;
   if (!http.begin(client, url)) {
+    Serial.println("route: http.begin failed");
     return;
   }
   http.setTimeout(kRequestTimeoutMs);
+  Serial.printf("route: GET %s (heap %u)\n", cs, static_cast<unsigned>(heap));
   const int code = http.GET();
   if (code == HTTP_CODE_NOT_FOUND) {
     routeCachePut(cs, "");  // no such route: negative-cache, stop asking
@@ -362,6 +369,8 @@ void fetchRoutes() {
 void setPollFn(PollFn fn) { s_poll_fn = fn; }
 
 size_t aircraftCount() { return s_aircraft_count; }
+
+unsigned long lastFetchMs() { return s_last_fetch_ms; }
 
 const Aircraft* aircraftList() { return s_aircraft; }
 
@@ -447,6 +456,8 @@ bool fetchUpdate(double center_lat, double center_lon, float fetch_radius_km) {
   if (!fetchAircraftList(center_lat, center_lon, fetch_radius_km)) {
     return false;
   }
+  // Stamp before the route lookup: these positions are already this old.
+  s_last_fetch_ms = millis();
   // Only now, on a clean heap, look up routes.
   fetchRoutes();
   return true;
