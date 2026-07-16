@@ -244,47 +244,6 @@ void offsetKmFromCenter(float lat, float lon, float* dx_km, float* dy_km,
   *dist_km = sqrtf((*dx_km) * (*dx_km) + (*dy_km) * (*dy_km));
 }
 
-/** Dead-reckons lat/lon forward by dt_s along the aircraft's ground track.
- *  Produces TRUE lat/lon (with the cos(lat) longitude correction) so that
- *  latLonToScreen() distorts it exactly the way it distorts a real fix — the
- *  predicted dot therefore lands where the next real fix will be drawn. */
-void extrapolatePosition(const services::adsb::Aircraft& plane, float dt_s,
-                         float* out_lat, float* out_lon) {
-  *out_lat = plane.lat;
-  *out_lon = plane.lon;
-
-  if (!config::kAircraftInterpolation) {
-    return;
-  }
-  if (!(dt_s > 0.0f) || dt_s > config::kMaxExtrapolateSeconds) {
-    return;  // no fix yet, or too stale to trust the heading
-  }
-  if (!(plane.gs_knots > 0.0f) || std::isnan(plane.track_deg)) {
-    return;  // no usable velocity: leave it parked
-  }
-
-  constexpr float kDegToRad = 0.01745329252f;
-  const float km = plane.gs_knots * 1.852f * dt_s / 3600.0f;
-  const float track_rad = plane.track_deg * kDegToRad;
-  const float dnorth_km = km * cosf(track_rad);
-  const float deast_km = km * sinf(track_rad);
-
-  *out_lat = plane.lat + dnorth_km / kKmPerDeg;
-  const float coslat = cosf(plane.lat * kDegToRad);
-  if (fabsf(coslat) > 0.01f) {
-    *out_lon = plane.lon + deast_km / (kKmPerDeg * coslat);
-  }
-}
-
-/** Seconds since the positions currently held were fetched. */
-float secondsSinceFix() {
-  const unsigned long fixed_at = services::adsb::lastFetchMs();
-  if (fixed_at == 0) {
-    return 0.0f;
-  }
-  return static_cast<float>(millis() - fixed_at) / 1000.0f;
-}
-
 float innerRingMaxKm() {
   const float outer_km = radar::rangeCurrent().outer_km;
   return outer_km * (static_cast<float>(radar::kGridOuterRadius -
@@ -686,12 +645,9 @@ void drawAircraft() {
   size_t draw_count = 0;
   size_t dot_count = 0;
 
-  const float dt_s = secondsSinceFix();
-
   for (size_t i = 0; i < n; ++i) {
-    float lat = 0.0f;
-    float lon = 0.0f;
-    extrapolatePosition(planes[i], dt_s, &lat, &lon);
+    const float lat = planes[i].lat;
+    const float lon = planes[i].lon;
 
     float dx_km = 0.0f;
     float dy_km = 0.0f;
